@@ -125,6 +125,7 @@ namespace VmgToEml
 
         private static Regex _mailAddressPattern1 = new Regex(@"<(?<mailAddress>[a-zA-Z0-9][a-zA-Z0-9\._-]*@[a-zA-Z0-9_-][a-zA-Z0-9\._-]*)>", RegexOptions.Compiled);
         private static Regex _mailAddressPattern2 = new Regex(@"(?<mailAddress>[a-zA-Z0-9][a-zA-Z0-9\._-]*@[a-zA-Z0-9_-][a-zA-Z0-9\._-]*)", RegexOptions.Compiled);
+        private static Regex _endVBodyEscapePattern = new Regex(@"^/+END:VBODY\r?\n?$", RegexOptions.Compiled);
 
         private static void TranslateVBODY(InputFileBuffer reader, DirectoryInfo outFileDir)
         {
@@ -143,34 +144,42 @@ namespace VmgToEml
             }
             if (reader.IsEof())
                 throw new Exception(string.Format("END:VBODYが見つかりません。: pos={0}", reader.Position));
-            var fromMailAddress = headers
-                .Where(s => s.StartsWith("From:"))
-                .Select(s => s.Substring(5).Trim())
-                .Select(s => {
-                    var m = _mailAddressPattern1.Match(s);
-                    if (!m.Success)
-                        m = _mailAddressPattern2.Match(s);
-                    if (!m.Success)
-                        return null;
-                    else
-                        return m.Groups["mailAddress"].Value;
-
-                })
-                .Where(s => s != null)
-                .FirstOrDefault();
-            var date = headers
-                .Where(s => s.StartsWith("Date:"))
-                .Select(s => s.Substring(5).Trim())
-                .Select(s => {
-                    DateTime dateTime;
-                    return DateTime.TryParse(s, out dateTime) ? dateTime : (DateTime?)null;
-                })
-                .Where(dateTime => dateTime != null)
-                .FirstOrDefault();
-            if (fromMailAddress == null || date == null)
-                throw new Exception("FromヘッダまたはDateヘッダがありません。");
-            var messageId = string.Format("{0}.{1}", date.Value.ToString("yyyyMMddHHmmss"), fromMailAddress);
-            headers.Insert(0, string.Format("Message-Id: {0}\r\n", messageId));
+            if (!headers.Any(header => header.StartsWith("Message-Id:")))
+            {
+                // Message-Id ヘッダが存在しない場合は、 From ヘッダと Date ヘッダの内容から作る。
+                var fromMailAddress = headers
+                    .Where(s => s.StartsWith("From:"))
+                    .Select(s => s.Substring(5).Trim())
+                    .Select(s =>
+                    {
+                        var m = _mailAddressPattern1.Match(s);
+                        if (!m.Success)
+                            m = _mailAddressPattern2.Match(s);
+                        if (!m.Success)
+                            return null;
+                        else
+                            return m.Groups["mailAddress"].Value;
+                    })
+                    .Where(s => s != null)
+                    .FirstOrDefault();
+                var date = headers
+                    .Where(s => s.StartsWith("Date:"))
+                    .Select(s => s.Substring(5).Trim())
+                    .Select(s =>
+                    {
+                        DateTime dateTime;
+                        return DateTime.TryParse(s, out dateTime) ? dateTime : (DateTime?)null;
+                    })
+                    .Where(dateTime => dateTime != null)
+                    .FirstOrDefault();
+                if (fromMailAddress == null || date == null)
+                    throw new Exception("FromヘッダまたはDateヘッダがありません。");
+                headers.Insert(0, string.Format("Message-Id: {0}.{1}\r\n", date.Value.ToString("yyyyMMddHHmmss"), fromMailAddress));
+            }
+            var messageId = headers
+                    .Where(s => s.StartsWith("Message-Id:"))
+                    .Select(s => s.Substring(11).Trim())
+                    .First();
             var outFile = new FileInfo(Path.Combine(outFileDir.FullName, messageId + ".eml"));
             using (var outStream = outFile.Create())
             {
@@ -182,13 +191,25 @@ namespace VmgToEml
                 }
                 // ヘッダの後の空行の出力
                 writer.Write("\r\n");
+
+
                 // "END:VBODY" が見つかるまでコピー
                 while (!reader.IsEof())
                 {
+                    // メール本文中に "END:VBODY" が書かれていても .vmg ファイルでは "/END:VBODY" にエスケープされているので以下の条件には HIT しない。
                     if (reader.StartsWith("END:VBODY"))
                         break;
                     var data = reader.ReadLine();
-                    writer.Write(data);
+                    var line = Encoding.ASCII.GetString(data);
+                    if (_endVBodyEscapePattern.IsMatch(line))
+                    {
+                        // "/END:VBODY" が見つかった場合は、エスケープを解除するために先頭の '/' を除去する。
+                        writer.Write(line.Substring(1));
+                    }
+                    else
+                    {
+                        writer.Write(data);
+                    }
                     //System.Diagnostics.Debug.WriteLine("copied: " + Encoding.ASCII.GetString(data));
 
                 }
